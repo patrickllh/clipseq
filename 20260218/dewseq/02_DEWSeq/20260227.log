@@ -1,0 +1,423 @@
+>
+library(DEWSeq)
+library(IHW)
+library(tidyverse)
+library(data.table)
+# the files get big so i run in the NAIST server
+# run in server like this:
+# nohup Rscript script.R > output.log 2>&1 &
+
+setwd(getwd())
+
+# I made the input files using HTseq according to DEWseq and HTseq's documentations
+
+countFile <- "matrix.gz"
+annotationFile <- "mapping.gz"
+
+countData <- fread(countFile, sep = "\t") # i did head(countData) to know what to put in colData factors later
+annotationData <- fread(annotationFile, sep = "\t")
+
+# create dataset and metadata
+colData <- data.frame(row.names = colnames(countData)[-1],
+                      type = factor(
+                        c("IN","IN","IP","IP"),
+                        levels = c("IN","IP"))) # remember...the first element here is going to be the reference
+
+ddw <- DESeqDataSetFromSlidingWindows(countData  = countData,
+                                      colData    = colData,
+                                      annotObj   = annotationData,
+                                      tidy       = TRUE,
+                                      design     = ~type)
+
+# filter out low count windows
+keep <- rowSums(counts(ddw)) >= 10 # i'm thinking of making it just 5
+ddw <- ddw[keep,]
+
+# calculate preliminary size factor for later calculations
+ddw <- estimateSizeFactors(ddw)
+# sizeFactors(ddw)
+
+# filter an mRNA-only list then calculate its size factor then put back to dataset (this is accd to the docs...)
+ddw_mRNAs <- ddw[ rowData(ddw)[,"gene_type"] == "protein_coding", ]
+ddw_mRNAs <- estimateSizeFactors(ddw_mRNAs)
+sizeFactors(ddw) <- sizeFactors(ddw_mRNAs)
+
+# From the docs: "In general, when there is asymmetry in the data, like enrichment in IP over control,
+# it is a good pratice to call differentially expressed features with DESeq2
+# and then exclude them for normalisation"
+# so I try to do that according to their code in the docs
+# i am not sure yet though how to call differentially expressed "features"...
+# how is it different from differentially expressed windows?
+# anyway for now...
+
+# make copy first, after getting the preliminary size factor avbove
+ddw_tmp <- ddw
+# then calculate some necessary statistical scores
+ddw_tmp <- estimateDispersions(ddw_tmp, fitType = "local", quiet = TRUE)
+ddw_tmp <- nbinomWaldTest(ddw_tmp)
+ddw_tmp_results <- results(ddw_tmp,contrast = c("type", "IP", "IN"),
+                           tidy = TRUE, filterFun =  ihw)
+# get those "differentially expressed features"
+tmp_significant_windows <- ddw_tmp_results %>%
+  dplyr::filter(padj < 0.05) %>%
+  dplyr::pull(row)
+
+# remove those "differentially expressed features"
+ddw_mRNAs <- ddw_mRNAs[ !rownames(ddw_mRNAs) %in% tmp_significant_windows, ]
+
+# data is know filtered
+# calculate final size factors
+ddw_mRNAs <- estimateSizeFactors(ddw_mRNAs)
+sizeFactors(ddw) <- sizeFactors(ddw_mRNAs)
+
+# this part assesses the most appropriate dispersion model
+# either "local" or "parametric"
+# we generate some graphs then assess visually
+# although at the end they have automatic way to decide
+decide_fit <- TRUE
+
+parametric_ddw  <- estimateDispersions(ddw, fitType="parametric")
+if(decide_fit){
+  local_ddw  <- estimateDispersions(ddw, fitType="local")
+}
+
+# plot parametric fit just for manual viewing
+png("dispersion_plot.png", width = 800, height = 600)
+plotDispEsts(parametric_ddw, main="Parametric fit")
+dev.off()
+
+# plot local fit just for manual viewing
+if(decide_fit){
+  # Save as PNG
+  png("dispersion_plot_local.png", width = 800, height = 600)
+  plotDispEsts(local_ddw, main="Local fit")
+  dev.off()}
+
+# calculate some stats for the dispersion.
+# here the docs pay attention to the median value (how different is the dispersion from the fit)
+parametricResid <- na.omit(with(mcols(parametric_ddw),abs(log(dispGeneEst)-log(dispFit))))
+if(decide_fit){
+  localResid <- na.omit(with(mcols(local_ddw),abs(log(dispGeneEst)-log(dispFit))))
+  residDf <- data.frame(residuals=c(parametricResid,localResid),
+                        fitType=c(rep("parametric",length(parametricResid)),
+                                  rep("local",length(localResid))))
+  summary(residDf)
+}
+
+# plot overlaid histogram to compare counts with high dispersion between the two fits
+# again just for manual assessment
+if(decide_fit){
+  png("residuals_histogram.png", width = 1000, height = 800)
+
+  print(
+    ggplot(residDf, aes(x = residuals, fill = fitType)) +
+      scale_fill_manual(values = c("darkred", "darkblue")) +
+      geom_histogram(alpha = 0.5, position='identity', bins = 100) +
+      theme_bw()
+  )
+
+  dev.off()
+}
+
+# this is the important part. it will output which it decides to use!!!
+if(decide_fit){
+  summary(localResid)
+  if (median(localResid) <= median(parametricResid)){
+    cat("chosen fitType: local")
+    ddw <- local_ddw
+  }else{
+    cat("chosen fitType: parametric")
+    ddw <- parametric_ddw
+  }
+  rm(local_ddw,parametric_ddw,residDf,parametricResid,localResid)
+}else{
+  ddw <- parametric_ddw
+  rm(parametric_ddw)
+}
+
+# based on the output above, we will do the DEWseq with the fitType either parametric or local
+# in this run i found it to be parametric so...
+ddw <- estimateDispersions(ddw, fitType = "parametric", quiet = TRUE)
+ddw <- nbinomWaldTest(ddw)
+
+resultWindows <- resultsDEWSeq(ddw,
+                               contrast = c("type", "IP", "IN"),
+                               tidy = TRUE) %>% as_tibble
+resultWindows
+
+resultWindows[,"p_adj_IHW"] <- adj_pvalues(ihw(pSlidingWindows ~ baseMean,
+                                               data = resultWindows,
+                                               alpha = 0.05,
+                                               nfolds = 10))
+
+resultWindows <- resultWindows %>%
+  mutate(significant = resultWindows$p_adj_IHW < 0.01)
+
+sum(resultWindows$significant)
+
+resultWindows %>%
+  filter(significant) %>%
+  arrange(desc(log2FoldChange)) %>%
+  .[["gene_name"]] %>%
+  unique %>%
+  head(200)
+
+write.csv(resultWindows, "DEWSeq_results.csv", row.names = FALSE)
+Loading required package: R.utils
+Loading required package: R.oo
+Loading required package: R.methodsS3
+R.methodsS3 v1.8.2 (2022-06-13 22:00:14 UTC) successfully loaded. See ?R.methodsS3 for help.
+R.oo v1.27.1 (2025-05-02 21:00:05 UTC) successfully loaded. See ?R.oo for help.
+
+Attaching package: ‘R.oo’
+
+The following object is masked from ‘package:R.methodsS3’:
+
+    throw
+
+The following objects are masked from ‘package:methods’:
+
+    getClasses, getMethods
+
+The following objects are masked from ‘package:base’:
+
+    attach, detach, load, save
+
+R.utils v2.13.0 (2025-02-24 21:20:02 UTC) successfully loaded. See ?R.utils for help.
+
+Attaching package: ‘R.utils’
+
+The following object is masked from ‘package:utils’:
+
+    timestamp
+
+The following objects are masked from ‘package:base’:
+
+    cat, commandArgs, getOption, isOpen, nullfile, parse, use, warnings
+
+Loading required package: DESeq2
+Loading required package: S4Vectors
+Loading required package: stats4
+Loading required package: BiocGenerics
+Loading required package: generics
+
+Attaching package: ‘generics’
+
+The following object is masked from ‘package:R.utils’:
+
+    evaluate
+
+The following object is masked from ‘package:R.oo’:
+
+    compile
+
+The following objects are masked from ‘package:base’:
+
+    as.difftime, as.factor, as.ordered, intersect, is.element, setdiff,
+    setequal, union
+
+
+Attaching package: ‘BiocGenerics’
+
+The following objects are masked from ‘package:stats’:
+
+    IQR, mad, sd, var, xtabs
+
+The following objects are masked from ‘package:base’:
+
+    anyDuplicated, aperm, append, as.data.frame, basename, cbind,
+    colnames, dirname, do.call, duplicated, eval, evalq, Filter, Find,
+    get, grep, grepl, is.unsorted, lapply, Map, mapply, match, mget,
+    order, paste, pmax, pmax.int, pmin, pmin.int, Position, rank,
+    rbind, Reduce, rownames, sapply, saveRDS, table, tapply, unique,
+    unsplit, which.max, which.min
+
+
+Attaching package: ‘S4Vectors’
+
+The following object is masked from ‘package:utils’:
+
+    findMatches
+
+The following objects are masked from ‘package:base’:
+
+    expand.grid, I, unname
+
+Loading required package: IRanges
+
+Attaching package: ‘IRanges’
+
+The following object is masked from ‘package:R.oo’:
+
+    trim
+
+Loading required package: GenomicRanges
+Loading required package: Seqinfo
+Loading required package: SummarizedExperiment
+Loading required package: MatrixGenerics
+Loading required package: matrixStats
+
+Attaching package: ‘MatrixGenerics’
+
+The following objects are masked from ‘package:matrixStats’:
+
+    colAlls, colAnyNAs, colAnys, colAvgsPerRowSet, colCollapse,
+    colCounts, colCummaxs, colCummins, colCumprods, colCumsums,
+    colDiffs, colIQRDiffs, colIQRs, colLogSumExps, colMadDiffs,
+    colMads, colMaxs, colMeans2, colMedians, colMins, colOrderStats,
+    colProds, colQuantiles, colRanges, colRanks, colSdDiffs, colSds,
+    colSums2, colTabulates, colVarDiffs, colVars, colWeightedMads,
+    colWeightedMeans, colWeightedMedians, colWeightedSds,
+    colWeightedVars, rowAlls, rowAnyNAs, rowAnys, rowAvgsPerColSet,
+    rowCollapse, rowCounts, rowCummaxs, rowCummins, rowCumprods,
+    rowCumsums, rowDiffs, rowIQRDiffs, rowIQRs, rowLogSumExps,
+    rowMadDiffs, rowMads, rowMaxs, rowMeans2, rowMedians, rowMins,
+    rowOrderStats, rowProds, rowQuantiles, rowRanges, rowRanks,
+    rowSdDiffs, rowSds, rowSums2, rowTabulates, rowVarDiffs, rowVars,
+    rowWeightedMads, rowWeightedMeans, rowWeightedMedians,
+    rowWeightedSds, rowWeightedVars
+
+Loading required package: Biobase
+Welcome to Bioconductor
+
+    Vignettes contain introductory material; view with
+    'browseVignettes()'. To cite Bioconductor, see
+    'citation("Biobase")', and for packages 'citation("pkgname")'.
+
+
+Attaching package: ‘Biobase’
+
+The following object is masked from ‘package:MatrixGenerics’:
+
+    rowMedians
+
+The following objects are masked from ‘package:matrixStats’:
+
+    anyMissing, rowMedians
+
+Loading required package: BiocParallel
+── Attaching core tidyverse packages ──────────────────────────────────────────────────────────────────────────────────────────────────────────── tidyverse 2.0.0 ──
+✔ dplyr     1.2.0     ✔ readr     2.2.0
+✔ forcats   1.0.1     ✔ stringr   1.6.0
+✔ ggplot2   4.0.2     ✔ tibble    3.3.1
+✔ lubridate 1.9.5     ✔ tidyr     1.3.2
+✔ purrr     1.2.1
+── Conflicts ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── tidyverse_conflicts() ──
+✖ lubridate::%within%() masks IRanges::%within%()
+✖ ggplot2::alpha()      masks IHW::alpha()
+✖ dplyr::collapse()     masks IRanges::collapse()
+✖ dplyr::combine()      masks Biobase::combine(), BiocGenerics::combine()
+✖ dplyr::count()        masks matrixStats::count()
+✖ dplyr::desc()         masks IRanges::desc()
+✖ tidyr::expand()       masks S4Vectors::expand()
+✖ tidyr::extract()      masks R.utils::extract()
+✖ dplyr::filter()       masks stats::filter()
+✖ dplyr::first()        masks S4Vectors::first()
+✖ dplyr::lag()          masks stats::lag()
+✖ ggplot2::Position()   masks BiocGenerics::Position(), base::Position()
+✖ purrr::reduce()       masks GenomicRanges::reduce(), IRanges::reduce()
+✖ dplyr::rename()       masks S4Vectors::rename()
+✖ lubridate::second()   masks S4Vectors::second()
+✖ lubridate::second<-() masks S4Vectors::second<-()
+✖ dplyr::slice()        masks IRanges::slice()
+ℹ Use the conflicted package (<http://conflicted.r-lib.org/>) to force all conflicts to become errors
+data.table 1.18.2.1 using 26 threads (see ?getDTthreads).  Latest news: r-datatable.com
+
+Attaching package: ‘data.table’
+
+The following objects are masked from ‘package:lubridate’:
+
+    hour, isoweek, isoyear, mday, minute, month, quarter, second, wday,
+    week, yday, year
+
+The following objects are masked from ‘package:dplyr’:
+
+    between, first, last
+
+The following object is masked from ‘package:purrr’:
+
+    transpose
+
+The following object is masked from ‘package:SummarizedExperiment’:
+
+    shift
+
+The following object is masked from ‘package:GenomicRanges’:
+
+    shift
+
+The following object is masked from ‘package:IRanges’:
+
+    shift
+
+The following objects are masked from ‘package:S4Vectors’:
+
+    first, second
+
+Avoidable file copy in RAM took 6.319 seconds. This file is very unusual: it ends abruptly without a final newline, and also its size is a multiple of 4096 bytes. Please properly end the last row with a newline using for example 'echo >> file'.
+|--------------------------------------------------|
+|==================================================|
+There were 50 or more warnings (use warnings() to see the first 50)
+Warning messages:
+1: In DESeqDataSetFromSlidingWindows(countData = countData, colData = colData,  :
+  countData is a data.table or tibble object, converting it to data.frame. First column will be used as rownames
+2: In DESeqDataSetFromSlidingWindows(countData = countData, colData = colData,  :
+  Cannot find chromosomal positions for all entries in countData.
+            countData rows with missing annotation will be removed !
+gene-wise dispersion estimates
+mean-dispersion relationship
+final dispersion estimates
+gene-wise dispersion estimates
+mean-dispersion relationship
+final dispersion estimates
+null device
+          1
+null device
+          1
+   residuals           fitType
+ Min.   : 0.001001   Length:15222
+ 1st Qu.: 0.474650   Class :character
+ Median : 1.072243   Mode  :character
+ Mean   : 6.048028
+ 3rd Qu.:18.914219
+ Max.   :21.202868
+null device
+          1
+chosen fitType: parametric# A tibble: 6,810 × 20
+   chromosome   begin     end width strand unique_id gene_id gene_name gene_type
+   <chr>        <dbl>   <int> <int> <chr>  <chr>     <chr>   <chr>     <chr>
+ 1 chr1       1020199 1020249    50 +      ENSG0000… ENSG00… AGRN      protein_…
+ 2 chr1       1020219 1020269    50 +      ENSG0000… ENSG00… AGRN      protein_…
+ 3 chr1       1020239 1020289    50 +      ENSG0000… ENSG00… AGRN      protein_…
+ 4 chr1       1020299 1020349    50 +      ENSG0000… ENSG00… AGRN      protein_…
+ 5 chr1       1020319 1020369    50 +      ENSG0000… ENSG00… AGRN      protein_…
+ 6 chr1       1020339 1020373    34 +      ENSG0000… ENSG00… AGRN      protein_…
+ 7 chr1       1035276 1035324    48 +      ENSG0000… ENSG00… AGRN      protein_…
+ 8 chr1       1035644 1035694    50 +      ENSG0000… ENSG00… AGRN      protein_…
+ 9 chr1       1035664 1035714    50 +      ENSG0000… ENSG00… AGRN      protein_…
+10 chr1       1040664 1040714    50 +      ENSG0000… ENSG00… AGRN      protein_…
+# ℹ 6,800 more rows
+# ℹ 11 more variables: gene_region <chr>, Nr_of_region <int>,
+#   Total_nr_of_region <int>, window_number <int>, baseMean <dbl>,
+#   log2FoldChange <dbl>, lfcSE <dbl>, stat <dbl>, pvalue <dbl>,
+#   pSlidingWindows <dbl>, pSlidingWindows.adj <dbl>
+# ℹ Use `print(n = ...)` to see more rows
+[1] 202
+ [1] "RNU1-7P"       "RNU1-11P"      "PHACTR1"       "RNU1-77P"
+ [5] "EFL1"          "LINC01138"     "RNVU1-1"       "RNU1-88P"
+ [9] "RNVU1-2A"      "RNVU1-14"      "CH17-373J23.1" "RNVU1-19"
+[13] "PPM1H"         "BMPR1A"        "RNU1-19P"      "RNVU1-15"
+[17] "RNVU1-31"      "C5orf46"       "RNU1-18P"      "RP11-584P21.2"
+[21] "RNU1-63P"      "CH17-3B23.3"   "RNVU1-2"       "ZNF354B"
+[25] "RNU1-39P"      "RNU1-83P"      "RNU1-76P"      "RNVU1-28"
+[29] "RNU1-21P"      "RNU1-89P"      "RNU1-148P"     "RNU1-17P"
+[33] "WEE2"          "RNVU1-29"      "RNU1-136P"     "PIEZO2"
+[37] "RNU1-82P"      "LINC02778"     "RNU1-14P"      "RNU1-75P"
+[41] "PVT1"          "RNVU1-32"      "SRRM2"         "CH17-353B19.2"
+[45] "RNVU1-6"       "RNVU1-17"      "RNU1-35P"      "IL32"
+[49] "RNU1-125P"     "FILIP1"        "AGRN"          "RNU1-150P"
+[53] "SEMA4D"        "RNU1-38P"      "FOXC1"         "RNU1-104P"
+[57] "RNU1-22P"      "FBXO31"        "KMT2D"         "ZNF703"
+[61] "RP11-753A21.1" "HTR1F"         "RNU1-34P"      "LARP1"
+[65] "IRF2BP2"       "RNU11"         "TBC1D2B"       "RNVU1-7"
+[69] "HNRNPU"        "RNVU1-27"

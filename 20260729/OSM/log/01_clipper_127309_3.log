@@ -1,0 +1,9 @@
+{'bam': '/work/pa-hilario/clipseq/20260421/OSM/output/mVenus-Sorbitol-rep6_L2_R1.genome.Aligned.sort.dedup.bam', 'species': 'GRCh38v35noalt', 'outfileF': 'output/mVenus-Sorbitol-rep6_L2_R1.peaks.bed', 'gene': None, 'minreads': 3, 'poisson_cutoff': 0.05, 'use_global_cutoff': True, 'FDR_alpha': 0.05, 'binom': 0.05, 'threshold': None, 'maxgenes': None, 'np': '48', 'plotit': False, 'verbose': True, 'quiet': False, 'save_pickle': False, 'debug': False, 'max_gap': 15, 'timeout': None, 'datadir': '/work/pa-hilario/anaconda3/envs/clipper3/lib/python3.7/site-packages/clipper/data', 'premRNA': True, 'gtfFile': None, 'method': 'binomial', 'SloP': True, 'bonferroni_correct': True, 'algorithm': 'spline', 'reverse_strand': False, 'max_width': 75, 'min_width': 50}
+WARNING:py.warnings:/work/pa-hilario/anaconda3/envs/clipper3/lib/python3.7/site-packages/scipy/interpolate/fitpack2.py:253: UserWarning: 
+The maximal number of iterations maxit (set to 20 by the program)
+allowed for finding a smoothing spline with fp=s has been reached: s
+too small.
+There is an approximation returned but the corresponding weighted sum
+of squared residuals does not satisfy the condition abs(fp-s)/s < tol.
+  warnings.warn(message)
+

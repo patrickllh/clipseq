@@ -1,0 +1,30 @@
+#!/bin/bash
+
+#SBATCH --partition=cluster_long
+#SBATCH --job-name=18_UCSC
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=52
+#SBATCH --output=%x_%j.log
+#SBATCH --mem=0
+#SBATCH --time=100:00:00
+
+set -euo pipefail
+source /work/pa-hilario/anaconda3/etc/profile.d/conda.sh
+ulimit -n 65536
+conda activate ucsc_tools
+conda list
+
+mkdir -p output
+
+bedgraphs=(
+SNRNP70-Sorbitol-rep1_L1_R1.cpm.bw.bedGraph.final.bedGraph
+SNRNP70-Sorbitol-rep2_L2_R1.cpm.bw.bedGraph.final.bedGraph
+mVenus-Sorbitol-rep5_L1_R1.cpm.bw.bedGraph.final.bedGraph
+mVenus-Sorbitol-rep6_L2_R1.cpm.bw.bedGraph.final.bedGraph
+)
+
+for bg in "${bedgraphs[@]}"; do
+    sample=$(basename "${bg}" .bw.bedGraph.final.bedGraph)
+    bedGraphToBigWig "output/${bg}" output/genome_ref/chrNameLength.txt "output/${sample}.peaks.consensus.bw"
+done
